@@ -9,6 +9,7 @@ import numpy as np
 from norfair import Detection, Tracker
 from tqdm import tqdm
 from ultralytics import YOLO
+import ffmpeg  # Add this import
 
 
 def setup_logging(args=None):  # Modified to accept args
@@ -155,12 +156,13 @@ def process_video(video_path, args, model, target_classes_set):
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if fps <= 0 or total_frames <= 0:
-            logging.error(f"Invalid video properties for {video_path}. Skipping.")
+            logging.error(
+                f"Invalid video properties for {video_path} (fps: {fps}, frames: {total_frames}). Skipping."
+            )
             cap.release()
             return
 
         # Initialize Norfair Tracker
-        # Using IoU distance for bounding boxes
         tracker = Tracker(
             distance_function="iou",
             distance_threshold=args.distance_threshold,
@@ -168,21 +170,17 @@ def process_video(video_path, args, model, target_classes_set):
             initialization_delay=args.initialization_delay,
         )
 
-        # Store track info including bounding boxes per frame
-        # track_id -> {class_name, start_frame, last_seen_frame, boxes: {frame_idx: box_coords}}
         track_data_store = {}
         frame_idx = 0
 
-        # Frame processing loop
         with tqdm(
             total=total_frames, desc=f"Processing {os.path.basename(video_path)}"
         ) as pbar:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    break  # End of video
+                    break
 
-                # Perform detection
                 try:
                     results = model(
                         frame,
@@ -192,21 +190,18 @@ def process_video(video_path, args, model, target_classes_set):
                     )[0]
                 except Exception as e:
                     logging.error(f"Error during YOLO detection: {e}")
-                    continue  # Skip frame on detection error
+                    continue
 
-                # Convert detections
                 detections = yolo_detections_to_norfair(
                     results, target_classes_set, model.names
                 )
 
-                # Update tracker
                 try:
                     current_tracked_objects = tracker.update(detections=detections)
                 except Exception as e:
                     logging.error(f"Error during Norfair update: {e}")
-                    continue  # Skip frame on tracking error
+                    continue
 
-                # Aggregate Track Lifespan Info and store boxes
                 for obj in current_tracked_objects:
                     track_id = obj.id
                     class_name = (
@@ -214,20 +209,18 @@ def process_video(video_path, args, model, target_classes_set):
                         if obj.label
                         else obj.last_detection.data.get("class_name", "unknown")
                     )
-                    box_coords = obj.estimate  # Get the bounding box estimate
+                    box_coords = obj.estimate
 
                     if track_id not in track_data_store:
                         track_data_store[track_id] = {
                             "class_name": class_name,
                             "start_frame": frame_idx,
                             "last_seen_frame": frame_idx,
-                            "boxes": {frame_idx: box_coords},  # Store first box
+                            "boxes": {frame_idx: box_coords},
                         }
                     else:
                         track_data_store[track_id]["last_seen_frame"] = frame_idx
-                        track_data_store[track_id]["boxes"][frame_idx] = (
-                            box_coords  # Store subsequent boxes
-                        )
+                        track_data_store[track_id]["boxes"][frame_idx] = box_coords
 
                 frame_idx += 1
                 pbar.update(1)
@@ -235,7 +228,6 @@ def process_video(video_path, args, model, target_classes_set):
         cap.release()
         logging.info(f"Finished frame processing for {video_path}")
 
-        # Log detected objects summary
         if track_data_store:
             detected_objects_summary = [
                 f"{data['class_name']}_{track_id}"
@@ -249,7 +241,6 @@ def process_video(video_path, args, model, target_classes_set):
                 f"No target objects detected in {os.path.basename(video_path)}"
             )
 
-        # Video Slicing Loop
         logging.info(f"Starting slicing phase for {video_path}")
         if not track_data_store:
             logging.info(f"No tracks found or persisted in {video_path}")
@@ -262,104 +253,189 @@ def process_video(video_path, args, model, target_classes_set):
             duration_frames = data["last_seen_frame"] - data["start_frame"] + 1
             duration_seconds = duration_frames / fps
 
-            # Filter by Duration
             if duration_seconds < args.min_track_seconds:
                 continue
 
             start_sec = data["start_frame"] / fps
-            end_sec = data["last_seen_frame"] / fps
+            slice_duration_sec = (data["last_seen_frame"] + 1) / fps - start_sec
+
             object_id = f"{data['class_name']}_{track_id}"
             base_name = os.path.splitext(os.path.basename(video_path))[0]
-            # Basic sanitization for filename
             safe_object_id = "".join(
                 c for c in object_id if c.isalnum() or c in ("_", "-")
             ).rstrip()
 
             start_time_iso = format_time_iso(start_sec)
-            end_time_iso = format_time_iso(end_sec)
+            end_sec_for_filename = (data["last_seen_frame"]) / fps
+            end_time_iso = format_time_iso(end_sec_for_filename)
 
             slice_filename = (
                 f"{base_name}_{safe_object_id}_{start_time_iso}_{end_time_iso}.mp4"
             )
             output_path = os.path.join(args.output_dir, slice_filename)
 
-            # Create Slice with Overlays
             try:
-                cap_slice = cv2.VideoCapture(video_path)
-                if not cap_slice.isOpened():
-                    logging.error(f"Failed to reopen video for slicing: {video_path}")
-                    continue
-
-                # Check if start frame is valid
-                if not cap_slice.set(cv2.CAP_PROP_POS_FRAMES, data["start_frame"]):
-                    logging.error(
-                        f"Failed to set start frame {data['start_frame']} for slicing {video_path}"
-                    )
-                    cap_slice.release()
-                    continue
-
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                # fourcc = cv2.VideoWriter_fourcc(*"av01")
-                out_slice = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-                if not out_slice.isOpened():
-                    logging.error(f"Failed to open VideoWriter for: {output_path}")
-                    cap_slice.release()
-                    continue
-
-                # Write frames for the slice with overlays
-                for current_frame_idx in range(
-                    data["start_frame"], data["last_seen_frame"] + 1
-                ):
-                    ret_slice, frame_slice = cap_slice.read()
-                    if not ret_slice:
-                        logging.warning(
-                            f"Could not read frame {current_frame_idx} while slicing {slice_filename}. Slice might be shorter."
+                if not args.draw_bounding_boxes:
+                    (
+                        ffmpeg.input(video_path, ss=start_sec, t=slice_duration_sec)
+                        .output(
+                            output_path,
+                            c="copy",
+                            video_bitrate=None,
+                            audio_bitrate=None,
                         )
-                        break
+                        .overwrite_output()
+                        .run(capture_stdout=True, capture_stderr=True, quiet=True)
+                    )
+                    logging.debug(
+                        f"Successfully created slice (direct copy): {output_path}"
+                    )
+                    slice_count += 1
+                else:
+                    cap_slice = cv2.VideoCapture(video_path)
+                    if not cap_slice.isOpened():
+                        logging.error(
+                            f"Failed to reopen video for slicing with bboxes: {video_path}"
+                        )
+                        continue
 
-                    # Draw bounding box if it exists for this frame and track and if drawing is enabled
-                    if args.draw_bounding_boxes and current_frame_idx in data["boxes"]:
-                        box = data["boxes"][current_frame_idx]
-                        # Ensure box has 2 points (top-left, bottom-right)
-                        if box is not None and len(box) == 2:
-                            pt1 = tuple(map(int, box[0]))
-                            pt2 = tuple(map(int, box[1]))
-                            cv2.rectangle(
-                                frame_slice, pt1, pt2, (0, 255, 0), 2
-                            )  # Green box
-                            label = f"{data['class_name']} ID:{track_id}"
-                            # Put text above the box
-                            (w, h), _ = cv2.getTextSize(
-                                label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                    if not cap_slice.set(cv2.CAP_PROP_POS_FRAMES, data["start_frame"]):
+                        logging.error(
+                            f"Failed to set start frame {data['start_frame']} for slicing {slice_filename}"
+                        )
+                        cap_slice.release()
+                        continue
+
+                    slice_fps = cap_slice.get(cv2.CAP_PROP_FPS)
+                    if slice_fps <= 0:
+                        slice_fps = fps
+
+                    process = (
+                        ffmpeg.input(
+                            "pipe:",
+                            format="rawvideo",
+                            pix_fmt="bgr24",
+                            s=f"{width}x{height}",
+                            r=slice_fps,
+                        )
+                        .output(
+                            output_path,
+                            vcodec="libx264",
+                            video_bitrate="5M",
+                            preset="medium",
+                        )
+                        .overwrite_output()
+                        .run_async(pipe_stdin=True, quiet=True)
+                    )
+
+                    frames_to_write = data["last_seen_frame"] - data["start_frame"] + 1
+                    frames_written_successfully = 0
+                    for current_frame_num in range(frames_to_write):
+                        actual_frame_idx = data["start_frame"] + current_frame_num
+                        ret_slice, frame_slice = cap_slice.read()
+                        if not ret_slice:
+                            logging.warning(
+                                f"Could not read frame {actual_frame_idx} (attempt {current_frame_num + 1}/{frames_to_write}) while slicing with bboxes {slice_filename}. Slice might be shorter."
                             )
-                            text_pt = (
-                                pt1[0],
-                                pt1[1] - 5 if pt1[1] > 20 else pt1[1] + h + 5,
+                            break
+
+                        if actual_frame_idx in data["boxes"]:
+                            box = data["boxes"][actual_frame_idx]
+                            if box is not None and len(box) == 2:
+                                pt1 = tuple(map(int, box[0]))
+                                pt2 = tuple(map(int, box[1]))
+                                cv2.rectangle(frame_slice, pt1, pt2, (0, 255, 0), 2)
+                                label = f"{data['class_name']} ID:{track_id}"
+                                (w_text, h_text), _ = cv2.getTextSize(
+                                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                                )
+                                text_pt = (
+                                    pt1[0],
+                                    pt1[1] - 5 if pt1[1] > 20 else pt1[1] + h_text + 5,
+                                )
+                                cv2.putText(
+                                    frame_slice,
+                                    label,
+                                    text_pt,
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (0, 255, 0),
+                                    2,
+                                )
+
+                        try:
+                            process.stdin.write(frame_slice.tobytes())
+                            frames_written_successfully += 1
+                        except BrokenPipeError:
+                            logging.warning(
+                                f"Broken pipe while writing frame {actual_frame_idx} to ffmpeg for {slice_filename}. FFmpeg might have exited. Slice might be incomplete."
                             )
-                            cv2.putText(
-                                frame_slice,
-                                label,
-                                text_pt,
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                (0, 255, 0),
-                                2,
+                            break
+                        except Exception as e_pipe:
+                            logging.error(
+                                f"Error writing frame {actual_frame_idx} to ffmpeg pipe for {slice_filename}: {e_pipe}"
                             )
+                            break
 
-                    out_slice.write(frame_slice)
-
-                out_slice.release()
-                cap_slice.release()
-                logging.debug(f"Successfully created slice: {output_path}")
-                slice_count += 1
-
-            except Exception as e:
-                logging.error(f"Error creating slice {output_path}: {e}")
-                # Ensure resources are released even if error occurs mid-slicing
-                if "cap_slice" in locals() and cap_slice.isOpened():
+                    process.stdin.close()
+                    process.wait()
                     cap_slice.release()
-                if "out_slice" in locals() and out_slice.isOpened():
-                    out_slice.release()
+
+                    if (
+                        process.returncode == 0
+                        and frames_written_successfully == frames_to_write
+                    ):
+                        logging.debug(
+                            f"Successfully created slice with bboxes: {output_path}"
+                        )
+                    elif process.returncode == 0:
+                        logging.warning(
+                            f"Slice with bboxes {output_path} created, but frame count mismatch. Expected {frames_to_write}, wrote {frames_written_successfully}. FFmpeg exit code 0."
+                        )
+                    else:
+                        logging.error(
+                            f"Failed to create slice with bboxes: {output_path}. FFmpeg exit code: {process.returncode}. Wrote {frames_written_successfully}/{frames_to_write} frames."
+                        )
+                    slice_count += 1
+
+            except ffmpeg.Error as e:
+                error_message = e.stderr.decode("utf8") if e.stderr else str(e)
+                logging.error(
+                    f"ffmpeg error creating slice {output_path}: {error_message}"
+                )
+                if (
+                    args.draw_bounding_boxes
+                    and "cap_slice" in locals()
+                    and cap_slice.isOpened()
+                ):
+                    cap_slice.release()
+                if (
+                    args.draw_bounding_boxes
+                    and "process" in locals()
+                    and process.poll() is None
+                ):
+                    process.kill()
+            except Exception as e:
+                logging.error(f"Generic error creating slice {output_path}: {e}")
+                if (
+                    args.draw_bounding_boxes
+                    and "cap_slice" in locals()
+                    and cap_slice.isOpened()
+                ):
+                    cap_slice.release()
+                if (
+                    args.draw_bounding_boxes
+                    and "process" in locals()
+                    and "process.stdin" in locals()
+                    and not process.stdin.closed
+                ):
+                    process.stdin.close()
+                if (
+                    args.draw_bounding_boxes
+                    and "process" in locals()
+                    and process.poll() is None
+                ):
+                    process.kill()
 
         logging.info(
             f"Finished slicing for {video_path}. Created {slice_count} slices."
@@ -367,7 +443,6 @@ def process_video(video_path, args, model, target_classes_set):
 
     except Exception as e:
         logging.error(f"Failed to process video {video_path}: {e}")
-        # Ensure capture is released if an error occurred before release
         if "cap" in locals() and cap.isOpened():
             cap.release()
 
@@ -377,11 +452,9 @@ def main():
     args = parse_arguments()  # Parse arguments first
     setup_logging(args)  # Setup logging with args
 
-    # Convert target classes to lowercase set for efficient lookup
     target_classes_set = {cls.lower() for cls in args.target_classes}
     logging.info(f"Target classes: {target_classes_set}")
 
-    # Validate input/output directories
     if not os.path.isdir(args.input_dir):
         logging.error(f"Input directory not found: {args.input_dir}")
         sys.exit(1)
@@ -393,7 +466,6 @@ def main():
         logging.error(f"Could not create output directory {args.output_dir}: {e}")
         sys.exit(1)
 
-    # Find video files (adjust patterns as needed)
     video_patterns = ["*.mp4", "*.avi", "*.mov", "*.mkv"]
     video_files = []
     for pattern in video_patterns:
@@ -405,18 +477,16 @@ def main():
 
     logging.info(f"Found {len(video_files)} video files to process.")
 
-    # Load YOLO model once
     try:
         model = YOLO(args.model_name)
         logging.info(f"Loaded YOLO model: {args.model_name}")
-        # Verify target classes against model classes
         model_classes_lower = {name.lower() for name in model.names.values()}
         invalid_classes = target_classes_set - model_classes_lower
         if invalid_classes:
             logging.warning(
                 f"Target classes {invalid_classes} not found in model {args.model_name}. They will be ignored."
             )
-            target_classes_set -= invalid_classes  # Remove invalid classes
+            target_classes_set -= invalid_classes
         if not target_classes_set:
             logging.error(
                 "No valid target classes remain after checking against the model. Exiting."
@@ -427,7 +497,6 @@ def main():
         logging.error(f"Failed to load YOLO model {args.model_name}: {e}")
         sys.exit(1)
 
-    # Process each video
     for video_path in video_files:
         process_video(video_path, args, model, target_classes_set)
 
