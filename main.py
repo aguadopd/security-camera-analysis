@@ -11,13 +11,25 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 
-def setup_logging():
+def setup_logging(args=None):  # Modified to accept args
     """Configures the logging module."""
+    handlers = [logging.StreamHandler(sys.stdout)]
+    log_file_path = None
+
+    if args and args.log_to_file and args.output_dir:
+        # Ensure output_dir is created before attempting to log there.
+        # This is usually handled in main(), but good to be safe or if setup_logging is called elsewhere.
+        os.makedirs(args.output_dir, exist_ok=True)
+        log_file_path = os.path.join(args.output_dir, "processing.log")
+        handlers.append(logging.FileHandler(log_file_path))
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=handlers,
     )
+    if log_file_path:
+        logging.info(f"Logging to file: {log_file_path}")
 
 
 def parse_arguments():
@@ -81,6 +93,18 @@ def parse_arguments():
         type=float,
         default=1.0,
         help="Minimum track duration in seconds to save a slice (default: 1.0).",
+    )
+    parser.add_argument(
+        "--draw-bounding-boxes",
+        action="store_true",
+        default=False,
+        help="Draw bounding boxes on sliced videos (default: False).",
+    )
+    parser.add_argument(
+        "--log-to-file",
+        action="store_true",
+        default=False,
+        help="Enable logging to a file (processing.log) in the output directory.",
     )
     return parser.parse_args()
 
@@ -274,8 +298,8 @@ def process_video(video_path, args, model, target_classes_set):
                     cap_slice.release()
                     continue
 
-                # fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                fourcc = cv2.VideoWriter_fourcc(*"av01")
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                # fourcc = cv2.VideoWriter_fourcc(*"av01")
                 out_slice = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
                 if not out_slice.isOpened():
                     logging.error(f"Failed to open VideoWriter for: {output_path}")
@@ -293,8 +317,8 @@ def process_video(video_path, args, model, target_classes_set):
                         )
                         break
 
-                    # Draw bounding box if it exists for this frame and track
-                    if current_frame_idx in data["boxes"]:
+                    # Draw bounding box if it exists for this frame and track and if drawing is enabled
+                    if args.draw_bounding_boxes and current_frame_idx in data["boxes"]:
                         box = data["boxes"][current_frame_idx]
                         # Ensure box has 2 points (top-left, bottom-right)
                         if box is not None and len(box) == 2:
@@ -350,8 +374,8 @@ def process_video(video_path, args, model, target_classes_set):
 
 def main():
     """Main function to orchestrate video processing."""
-    setup_logging()
-    args = parse_arguments()
+    args = parse_arguments()  # Parse arguments first
+    setup_logging(args)  # Setup logging with args
 
     # Convert target classes to lowercase set for efficient lookup
     target_classes_set = {cls.lower() for cls in args.target_classes}
