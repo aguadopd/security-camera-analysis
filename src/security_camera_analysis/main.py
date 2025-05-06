@@ -25,12 +25,15 @@ def setup_logging(args=None):  # Modified to accept args
         handlers.append(logging.FileHandler(log_file_path))
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if args and args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=handlers,
     )
     if log_file_path:
         logging.info(f"Logging to file: {log_file_path}")
+
+    if args and args.verbose:
+        logging.debug("Verbose logging enabled")
 
 
 def parse_arguments():
@@ -100,6 +103,12 @@ def parse_arguments():
         action="store_true",
         default=False,
         help="Draw bounding boxes on sliced videos (default: False).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose (DEBUG level) logging (default: False).",
     )
     parser.add_argument(
         "--log-to-file",
