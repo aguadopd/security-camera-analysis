@@ -451,6 +451,7 @@ def main():
     """Main function to orchestrate video processing."""
     args = parse_arguments()  # Parse arguments first
     setup_logging(args)  # Setup logging with args
+    logging.info(f"Script arguments: {vars(args)}")
 
     target_classes_set = {cls.lower() for cls in args.target_classes}
     logging.info(f"Target classes: {target_classes_set}")
