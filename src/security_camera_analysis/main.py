@@ -9,7 +9,7 @@ import numpy as np
 from norfair import Detection, Tracker
 from tqdm import tqdm
 from ultralytics import YOLO
-import ffmpeg  # Add this import
+import ffmpeg
 
 
 def setup_logging(args=None):  # Modified to accept args

@@ -15,6 +15,13 @@ dependencies = [
     "ultralytics>=8.3.127",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+security-camera-analysis = "security_camera_analysis.main:main"
+
 [tool.mypy]
 [[tool.mypy.overrides]]
 module = ["ffmpeg.*", "tqdm.*", "ultralytics.*"]
