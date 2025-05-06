@@ -278,12 +278,7 @@ def process_video(video_path, args, model, target_classes_set):
                 if not args.draw_bounding_boxes:
                     (
                         ffmpeg.input(video_path, ss=start_sec, t=slice_duration_sec)
-                        .output(
-                            output_path,
-                            c="copy",
-                            video_bitrate=None,
-                            audio_bitrate=None,
-                        )
+                        .output(output_path, c="copy")
                         .overwrite_output()
                         .run(capture_stdout=True, capture_stderr=True, quiet=True)
                     )
