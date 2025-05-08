@@ -1,19 +1,24 @@
 [project]
+requires-python = ">=3.11,<4.0"
 name = "security-camera-analysis"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "Detect and track objects in videos, and save slices."
 readme = "README.md"
-requires-python = ">=3.11"
+authors = [{ name = "Pablo Daniel Aguado", email = "1@asdfasdf.com" }]
 dependencies = [
     "ffmpeg-python>=0.2.0",
-    "jupyter>=1.1.1",
-    "mypy>=1.15.0",
     "norfair[video]>=2.3.0",
     "pytest>=8.3.5",
-    "ruff>=0.11.8",
     "tqdm>=4.67.1",
     "ultralytics>=8.3.127",
 ]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15.0",
+    "ruff>=0.11.8",
+]
+
 
 [build-system]
 requires = ["hatchling"]

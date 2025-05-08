@@ -59,8 +59,8 @@ def parse_arguments():
     )
     parser.add_argument(
         "--model-name",
-        default="yolo11x.pt",
-        help="YOLO model name/path (default: yolov8n.pt).",
+        default="yolo11l.pt",
+        help="YOLO model name/path (default: yolo11l.pt).",
     )
     parser.add_argument(
         "--conf-threshold",
