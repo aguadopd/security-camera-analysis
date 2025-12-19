@@ -10,6 +10,7 @@ from norfair import Detection, Tracker
 from tqdm import tqdm
 from ultralytics import YOLO
 import ffmpeg
+import time
 
 
 def setup_logging(args=None):  # Modified to accept args
@@ -116,6 +117,14 @@ def parse_arguments():
         default=False,
         help="Enable logging to a file (processing.log) in the output directory.",
     )
+    parser.add_argument(
+        "--roi",
+        nargs=4,
+        type=int,
+        metavar=("x1", "y1", "x2", "y2"),
+        help="Region of interest as four integers: x1 y1 x2 y2 (pixel coordinates).",
+        default=None,
+    )
     return parser.parse_args()
 
 
@@ -154,22 +163,105 @@ def process_video(video_path, args, model, target_classes_set):
     """Processes a single video file for tracking and slicing."""
     logging.info(f"Starting processing for: {video_path}")
     try:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
+        # Open original video (used later for slicing). We'll optionally create
+        # a temporary cropped video for detection to speed up processing.
+        orig_cap = cv2.VideoCapture(video_path)
+        if not orig_cap.isOpened():
             logging.error(f"Could not open video file: {video_path}")
             return
 
-        # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if fps <= 0 or total_frames <= 0:
+        # Original video properties
+        orig_fps = orig_cap.get(cv2.CAP_PROP_FPS)
+        orig_width = int(orig_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_height = int(orig_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        orig_total_frames = int(orig_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if orig_fps <= 0 or orig_total_frames <= 0:
             logging.error(
-                f"Invalid video properties for {video_path} (fps: {fps}, frames: {total_frames}). Skipping."
+                f"Invalid video properties for {video_path} (fps: {orig_fps}, frames: {orig_total_frames}). Skipping."
             )
-            cap.release()
+            orig_cap.release()
             return
+
+        # Determine detection source: either the original file (no ROI) or a
+        # temporary cropped file (ROI provided).
+        temp_cropped_path = None
+        detect_cap = None
+        detect_fps = orig_fps
+        if args.roi_tuple:
+            x1, y1, x2, y2 = args.roi_tuple
+            # Clamp ROI to video bounds
+            x1 = max(0, min(x1, orig_width - 1))
+            y1 = max(0, min(y1, orig_height - 1))
+            x2 = max(0, min(x2, orig_width))
+            y2 = max(0, min(y2, orig_height))
+            roi_w = x2 - x1
+            roi_h = y2 - y1
+            if roi_w <= 0 or roi_h <= 0:
+                logging.error(
+                    f"ROI after clamping has non-positive size: {(x1, y1, x2, y2)}"
+                )
+                orig_cap.release()
+                return
+
+            if roi_w == orig_width and roi_h == orig_height and x1 == 0 and y1 == 0:
+                logging.info(
+                    "ROI equals full frame; skipping cropping and using original video for detection."
+                )
+                detect_cap = orig_cap
+                detect_fps = orig_fps
+            else:
+                # Create unique temp path inside output dir
+                base_name = os.path.splitext(os.path.basename(video_path))[0]
+                timestamp = int(time.time())
+                pid = os.getpid()
+                temp_cropped_path = os.path.join(
+                    args.output_dir, f".tmp_{base_name}_roi_{timestamp}_{pid}.mp4"
+                )
+                logging.info(
+                    f"Creating temporary cropped video: {temp_cropped_path} (crop {roi_w}x{roi_h} at {x1},{y1})"
+                )
+                try:
+                    (
+                        ffmpeg.input(video_path)
+                        .filter("crop", roi_w, roi_h, x1, y1)
+                        .output(
+                            temp_cropped_path,
+                            vcodec="libx264",
+                            preset="ultrafast",
+                            crf=23,
+                            r=orig_fps,
+                        )
+                        .overwrite_output()
+                        .run(capture_stdout=True, capture_stderr=True)
+                    )
+                except ffmpeg.Error as e:
+                    logging.error(
+                        f"ffmpeg crop failed for {video_path}: {e.stderr.decode('utf8') if e.stderr else str(e)}"
+                    )
+                    orig_cap.release()
+                    return
+
+                detect_cap = cv2.VideoCapture(temp_cropped_path)
+                if not detect_cap.isOpened():
+                    logging.error(
+                        f"Could not open temporary cropped video: {temp_cropped_path}"
+                    )
+                    orig_cap.release()
+                    # Attempt cleanup
+                    try:
+                        if os.path.exists(temp_cropped_path):
+                            os.remove(temp_cropped_path)
+                    except Exception:
+                        pass
+                    return
+
+                detect_fps = detect_cap.get(cv2.CAP_PROP_FPS)
+                logging.debug(
+                    f"Reopened cropped video {temp_cropped_path} with fps={detect_fps}"
+                )
+        else:
+            detect_cap = orig_cap
+            detect_fps = orig_fps
 
         # Initialize Norfair Tracker
         tracker = Tracker(
@@ -182,11 +274,13 @@ def process_video(video_path, args, model, target_classes_set):
         track_data_store = {}
         frame_idx = 0
 
+        # Use detect_cap for detection loop (could be original or temp cropped)
+        detect_total_frames = int(detect_cap.get(cv2.CAP_PROP_FRAME_COUNT))
         with tqdm(
-            total=total_frames, desc=f"Processing {os.path.basename(video_path)}"
+            total=detect_total_frames, desc=f"Processing {os.path.basename(video_path)}"
         ) as pbar:
             while True:
-                ret, frame = cap.read()
+                ret, frame = detect_cap.read()
                 if not ret:
                     break
 
@@ -220,21 +314,47 @@ def process_video(video_path, args, model, target_classes_set):
                     )
                     box_coords = obj.estimate
 
+                    # Map detection frame index (in detect_cap space) to original frame index
+                    # Use timestamps to be robust to fps differences
+                    time_sec = (
+                        frame_idx / detect_fps
+                        if detect_fps and detect_fps > 0
+                        else frame_idx / orig_fps
+                    )
+                    orig_frame_idx = int(round(time_sec * orig_fps))
+
+                    # Map box coordinates from cropped->original if ROI was used
+                    if args.roi_tuple:
+                        x_off, y_off = args.roi_tuple[0], args.roi_tuple[1]
+                        try:
+                            mapped_box = np.array(box_coords) + np.array([x_off, y_off])
+                        except Exception:
+                            mapped_box = box_coords
+                    else:
+                        mapped_box = box_coords
+
                     if track_id not in track_data_store:
                         track_data_store[track_id] = {
                             "class_name": class_name,
-                            "start_frame": frame_idx,
-                            "last_seen_frame": frame_idx,
-                            "boxes": {frame_idx: box_coords},
+                            "start_frame": orig_frame_idx,
+                            "last_seen_frame": orig_frame_idx,
+                            "boxes": {orig_frame_idx: mapped_box},
                         }
                     else:
-                        track_data_store[track_id]["last_seen_frame"] = frame_idx
-                        track_data_store[track_id]["boxes"][frame_idx] = box_coords
+                        track_data_store[track_id]["last_seen_frame"] = orig_frame_idx
+                        track_data_store[track_id]["boxes"][orig_frame_idx] = mapped_box
 
                 frame_idx += 1
                 pbar.update(1)
 
-        cap.release()
+        # Release detection cap if it was a separate temp file
+        try:
+            if detect_cap is not None and detect_cap is not orig_cap:
+                detect_cap.release()
+        except Exception:
+            pass
+
+        # orig_cap remains open for slicing below
         logging.info(f"Finished frame processing for {video_path}")
 
         if track_data_store:
@@ -260,13 +380,13 @@ def process_video(video_path, args, model, target_classes_set):
             track_data_store.items(), desc=f"Slicing {os.path.basename(video_path)}"
         ):
             duration_frames = data["last_seen_frame"] - data["start_frame"] + 1
-            duration_seconds = duration_frames / fps
+            duration_seconds = duration_frames / orig_fps
 
             if duration_seconds < args.min_track_seconds:
                 continue
 
-            start_sec = data["start_frame"] / fps
-            slice_duration_sec = (data["last_seen_frame"] + 1) / fps - start_sec
+            start_sec = data["start_frame"] / orig_fps
+            slice_duration_sec = (data["last_seen_frame"] + 1) / orig_fps - start_sec
 
             object_id = f"{data['class_name']}_{track_id}"
             base_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -275,7 +395,7 @@ def process_video(video_path, args, model, target_classes_set):
             ).rstrip()
 
             start_time_iso = format_time_iso(start_sec)
-            end_sec_for_filename = (data["last_seen_frame"]) / fps
+            end_sec_for_filename = (data["last_seen_frame"]) / orig_fps
             end_time_iso = format_time_iso(end_sec_for_filename)
 
             slice_filename = (
@@ -285,6 +405,7 @@ def process_video(video_path, args, model, target_classes_set):
 
             try:
                 if not args.draw_bounding_boxes:
+                    # Slice from original video (preserve context)
                     (
                         ffmpeg.input(video_path, ss=start_sec, t=slice_duration_sec)
                         .output(output_path, c="copy")
@@ -296,6 +417,7 @@ def process_video(video_path, args, model, target_classes_set):
                     )
                     slice_count += 1
                 else:
+                    # For drawing, open original video and seek to original start frame
                     cap_slice = cv2.VideoCapture(video_path)
                     if not cap_slice.isOpened():
                         logging.error(
@@ -312,14 +434,14 @@ def process_video(video_path, args, model, target_classes_set):
 
                     slice_fps = cap_slice.get(cv2.CAP_PROP_FPS)
                     if slice_fps <= 0:
-                        slice_fps = fps
+                        slice_fps = orig_fps
 
                     process = (
                         ffmpeg.input(
                             "pipe:",
                             format="rawvideo",
                             pix_fmt="bgr24",
-                            s=f"{width}x{height}",
+                            s=f"{orig_width}x{orig_height}",
                             r=slice_fps,
                         )
                         .output(
@@ -441,14 +563,32 @@ def process_video(video_path, args, model, target_classes_set):
                 ):
                     process.kill()
 
-        logging.info(
-            f"Finished slicing for {video_path}. Created {slice_count} slices."
-        )
+            # Cleanup: release original capture and delete temporary cropped file if created
+            try:
+                if "orig_cap" in locals() and orig_cap.isOpened():
+                    orig_cap.release()
+            except Exception:
+                pass
+
+            if temp_cropped_path:
+                try:
+                    if os.path.exists(temp_cropped_path):
+                        os.remove(temp_cropped_path)
+                        logging.info(
+                            f"Deleted temporary cropped video: {temp_cropped_path}"
+                        )
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to delete temporary cropped file {temp_cropped_path}: {e}"
+                    )
 
     except Exception as e:
         logging.error(f"Failed to process video {video_path}: {e}")
-        if "cap" in locals() and cap.isOpened():
-            cap.release()
+        try:
+            if "orig_cap" in locals() and orig_cap.isOpened():
+                orig_cap.release()
+        except Exception:
+            pass
 
 
 def main():
@@ -456,6 +596,23 @@ def main():
     args = parse_arguments()  # Parse arguments first
     setup_logging(args)  # Setup logging with args
     logging.info(f"Script arguments: {vars(args)}")
+
+    # Parse and validate ROI argument (if provided). Argparse now provides four ints when given.
+    if args.roi is not None:
+        try:
+            x1, y1, x2, y2 = args.roi
+            if x2 <= x1 or y2 <= y1:
+                logging.error(
+                    "ROI coordinates invalid: x2 must be > x1 and y2 must be > y1"
+                )
+                sys.exit(1)
+            args.roi_tuple = (x1, y1, x2, y2)
+            logging.info(f"ROI provided: {args.roi_tuple}")
+        except Exception as e:
+            logging.error(f"Failed to parse --roi: {e}")
+            sys.exit(1)
+    else:
+        args.roi_tuple = None
 
     target_classes_set = {cls.lower() for cls in args.target_classes}
     logging.info(f"Target classes: {target_classes_set}")

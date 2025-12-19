@@ -1,6 +1,7 @@
 # Security Camera Analysis
 
-A short Python script that detects and tracks objects from video —using
+A short Python script that detects and tracks objects from video (optionally
+just searching on a given Region Of Interest) —using
 [`norfair`](https://tryolabs.github.io/norfair/2.2/) and some detector (here a
 [`yolo11` by
 Ultralytics](https://docs.ultralytics.com/models/yolo11/#overview), [trained on
@@ -63,6 +64,7 @@ options:
                         Draw bounding boxes on sliced videos (default: False).
   --verbose             Enable verbose (DEBUG level) logging (default: False).
   --log-to-file         Enable logging to a file (processing.log) in the output directory.
+  --roi x1 y1 x2 y2     Region of interest as four integers: x1 y1 x2 y2 (pixel coordinates).
 ```
 
 Example:
@@ -177,7 +179,7 @@ But you may use any other `ultralytics`-compatible YOLO model.
 
 ## Development
 
-.
+- `uv run ruff format && uv run ruff check --fix`
 
 
 ## Meta
@@ -193,6 +195,11 @@ too, but still did review the output videos in ~20 min.
 ## Changelog
 
 - 2025-05-08: first version.
+- 2025-12-10: adding ROI after needing to use this again. Someone hit a
+  neighbour's car and I don't want to review so many false positives. Done 2
+  hours with GPT-5 mini and maybe Grok (these seem to be OK, and I'm not paying
+  for Copilot anymore). Had to guide and correct, but now there's a PLAN
+  action. What a time to be alive.
 
 
 ## To do
@@ -202,7 +209,7 @@ too, but still did review the output videos in ~20 min.
 - [X] Link to `norfair` parameters.
 - [ ] Cite alternatives, and explain why the ones I found weren't good for my
   use case.
-- [ ] Propose enhancements: roi, list of detector classes, GUI?, replace opencv
+- [ ] Propose enhancements: interactive roi, list of detector classes, GUI?, replace opencv
   with torchvision/torchcodec, ...
 - [ ] Add some type-hinting.
 - [ ] Add some tests.
